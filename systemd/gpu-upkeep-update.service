@@ -1,0 +1,11 @@
+[Unit]
+Description=Distribution updates without package removals or reboots (gpu-upkeep)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/systemd-inhibit --what=shutdown --who=gpu-upkeep --why=Installing-updates /usr/local/bin/gpu-upkeep update
+Nice=10
+IOWeight=20
+TimeoutStartSec=2h

@@ -1,0 +1,8 @@
+[Unit]
+Description=Disk-health and free-space checks (gpu-upkeep)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/gpu-upkeep check
+Nice=10
+TimeoutStartSec=120

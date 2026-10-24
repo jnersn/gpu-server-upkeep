@@ -1,0 +1,21 @@
+# gpu-upkeep settings (/etc/gpu-upkeep.conf). KEY=value lines; quote values with spaces.
+# Uncomment what you need; the values shown are the defaults.
+
+# Filesystems to check for free space, separated by spaces. A listed path that
+# isn't mounted is a warning, so add data disks here.
+#MOUNTS="/"
+
+# Warn below this much free space (percent).
+#MIN_FREE_PERCENT=10
+
+# Warn at this disk temperature (Celsius) and NVMe rated endurance used (percent).
+#MAX_DISK_TEMP=70
+#MAX_ENDURANCE_USED=90
+
+# Skip the update run while NVIDIA compute jobs are running (yes or no).
+#DEFER_FOR_GPU=yes
+
+# Warn when the last successful update is older than this (days), or the last
+# disk check older than this (hours).
+#STALE_UPDATE_DAYS=3
+#STALE_CHECK_HOURS=2

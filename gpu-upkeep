@@ -1,0 +1,244 @@
+#!/usr/bin/python3
+"""Unattended upkeep for a Linux GPU server: disk health, free space and automatic updates.
+
+  gpu-upkeep [status]        show the latest disk checks and update outcome, then any warnings
+  gpu-upkeep status --warnings   only the warnings (shown at SSH login)
+  gpu-upkeep check           collect disk health and free space (root; run by gpu-upkeep-health.timer)
+  gpu-upkeep update          install distribution updates (root; run by gpu-upkeep-update.timer)
+
+Settings are read from /etc/gpu-upkeep.conf (KEY=value lines); see gpu-upkeep.conf.example.
+"""
+import datetime
+import json
+import os
+from pathlib import Path
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+
+VERSION = '0.1.0'
+CONFIG = Path('/etc/gpu-upkeep.conf')
+STATE = Path('/var/lib/gpu-upkeep')
+DEFAULTS = {
+    'MOUNTS': '/',
+    'MIN_FREE_PERCENT': '10',
+    'MAX_DISK_TEMP': '70',
+    'MAX_ENDURANCE_USED': '90',
+    'DEFER_FOR_GPU': 'yes',
+    'STALE_UPDATE_DAYS': '3',
+    'STALE_CHECK_HOURS': '2',
+}
+LOGS = 'journalctl -u gpu-upkeep-health.service -u gpu-upkeep-update.service'
+
+
+def load_settings():
+    settings = dict(DEFAULTS)
+    try:
+        text = CONFIG.read_text()
+    except OSError:
+        text = ''
+    for line in text.splitlines():
+        key, sep, value = line.strip().partition('=')
+        if sep and key and not key.startswith('#'):
+            settings[key.strip()] = ' '.join(shlex.split(value, comments=True))
+    return settings
+
+
+def read_json(name):
+    try:
+        return json.loads((STATE / name).read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def write_json(name, data):
+    STATE.mkdir(mode=0o755, parents=True, exist_ok=True)
+    temporary = STATE / (name + '.tmp')
+    temporary.write_text(json.dumps(data, indent=2) + '\n')
+    temporary.chmod(0o644)
+    temporary.replace(STATE / name)
+
+
+def when(timestamp):
+    return datetime.datetime.fromtimestamp(timestamp).isoformat(sep=' ', timespec='minutes')
+
+
+# ---------------------------------------------------------------- check
+
+def check(settings):
+    max_temp = float(settings['MAX_DISK_TEMP'])
+    max_used = float(settings['MAX_ENDURANCE_USED'])
+    warnings = []
+    disks = []
+    scan = subprocess.run(['smartctl', '--scan-open', '--json'], capture_output=True, text=True)
+    try:
+        devices = json.loads(scan.stdout).get('devices', [])
+    except ValueError:
+        devices = []
+    if not devices:
+        warnings.append('Disk-health scan found no readable drives.')
+    for device in devices:
+        name = device['name']
+        result = subprocess.run(['smartctl', '-a', '--json', name], capture_output=True, text=True)
+        try:
+            data = json.loads(result.stdout)
+        except ValueError:
+            warnings.append(f'{name}: disk-health data could not be read.')
+            continue
+        issues = []
+        if result.returncode & 7:
+            issues.append('SMART command/read error')
+        if data.get('smart_status', {}).get('passed') is False:
+            issues.append('SMART health check failed')
+        nvme = data.get('nvme_smart_health_information_log', {})
+        if nvme.get('critical_warning', 0):
+            issues.append(f"NVMe critical warning {nvme['critical_warning']}")
+        if nvme.get('percentage_used', 0) >= max_used:
+            issues.append(f"rated endurance used: {nvme['percentage_used']}%")
+        if nvme.get('media_errors', 0):
+            issues.append(f"NVMe media errors: {nvme['media_errors']}")
+        if nvme.get('available_spare', 100) < nvme.get('available_spare_threshold', 0):
+            issues.append('NVMe spare capacity below threshold')
+        # Reallocated, pending and offline-uncorrectable sectors on SATA drives.
+        for attribute in data.get('ata_smart_attributes', {}).get('table', []):
+            if attribute['id'] in (5, 197, 198) and attribute.get('raw', {}).get('value', 0):
+                issues.append(f"{attribute['name']}: {attribute['raw']['value']}")
+        temperature = data.get('temperature', {}).get('current', nvme.get('temperature'))
+        if temperature is not None and temperature >= max_temp:
+            issues.append(f'high temperature: {temperature} C')
+        disks.append({'device': name, 'model': data.get('model_name', 'unknown'),
+                      'temperature_c': temperature, 'endurance_used_percent': nvme.get('percentage_used'),
+                      'warnings': issues})
+        warnings.extend(f'{name}: {issue}' for issue in issues)
+    storage = []
+    for location in settings['MOUNTS'].split():
+        if not os.path.ismount(location):
+            warnings.append(f'{location}: expected filesystem is not mounted.')
+            continue
+        usage = shutil.disk_usage(location)
+        percent_free = round(100 * usage.free / usage.total, 1)
+        storage.append({'path': location, 'free_gib': round(usage.free / 2**30, 1), 'free_percent': percent_free})
+        if percent_free < float(settings['MIN_FREE_PERCENT']):
+            warnings.append(f'{location}: only {percent_free}% free.')
+    write_json('status.json', {'checked_at': int(time.time()), 'disks': disks, 'storage': storage,
+                               'warnings': warnings})
+    for warning in warnings:
+        print('WARNING:', warning)
+    print(f'Checked {len(disks)} disks and {len(storage)} filesystems; {len(warnings)} warnings.')
+    return 0
+
+
+# ---------------------------------------------------------------- update
+
+def gpu_jobs():
+    """PIDs of running NVIDIA compute jobs; empty without NVIDIA or when nvidia-smi can't answer."""
+    if not shutil.which('nvidia-smi'):
+        return []
+    result = subprocess.run(['nvidia-smi', '--query-compute-apps=pid', '--format=csv,noheader'],
+                            capture_output=True, text=True)
+    if result.returncode:
+        # E.g. a driver/library mismatch after a driver update; a reboot is the fix, not more waiting.
+        print('nvidia-smi failed; not deferring for GPU jobs:', result.stderr.strip() or result.stdout.strip())
+        return []
+    return result.stdout.split()
+
+
+def update(settings):
+    previous = read_json('updates.json')
+    now = int(time.time())
+    result = {'checked_at': now, 'last_success': previous.get('last_success', 0)}
+    exit_code = 0
+    try:
+        jobs = gpu_jobs() if settings['DEFER_FOR_GPU'] == 'yes' else []
+        if jobs:
+            result['status'] = 'deferred while GPU jobs are running'
+            result['deferred_since'] = previous.get('deferred_since', now)
+            print(result['status'], '(PIDs ' + ', '.join(jobs) + ')')
+        else:
+            environment = dict(os.environ, DEBIAN_FRONTEND='noninteractive')
+            subprocess.run(['apt-get', '-o', 'APT::Update::Error-Mode=any', 'update'], check=True, env=environment)
+            # Installed packages and their new dependencies; keep local config, never remove packages.
+            subprocess.run(['apt-get', '-o', 'DPkg::Lock::Timeout=300',
+                            '-o', 'Dpkg::Options::=--force-confold', '--assume-yes',
+                            '--with-new-pkgs', '--no-remove', 'upgrade'], check=True, env=environment)
+            audit = subprocess.run(['dpkg', '--audit'], capture_output=True, text=True, check=True)
+            if audit.stdout.strip():
+                raise RuntimeError('Package database audit reported incomplete packages.')
+            result['status'] = 'successful'
+            result['last_success'] = int(time.time())
+    except (subprocess.CalledProcessError, OSError, RuntimeError) as error:
+        result['status'] = 'failed'
+        print(f'Automatic updates failed: {error}', file=sys.stderr)
+        exit_code = 1
+    write_json('updates.json', result)
+    return exit_code
+
+
+# ---------------------------------------------------------------- status
+
+def status(settings, warnings_only):
+    warnings = []
+    health = read_json('status.json')
+    if not health:
+        warnings.append('Disk-health report is not available yet.')
+    elif time.time() - health.get('checked_at', 0) > float(settings['STALE_CHECK_HOURS']) * 3600:
+        warnings.append(f"Disk-health checks are more than {settings['STALE_CHECK_HOURS']} hours old.")
+    warnings.extend(health.get('warnings', []))
+    updates = read_json('updates.json')
+    if not updates:
+        warnings.append('Automatic updates have not completed their first check.')
+    if updates.get('status') == 'failed':
+        warnings.append('Automatic updates failed; inspect journalctl -u gpu-upkeep-update.service.')
+    last_success = updates.get('last_success', 0)
+    stale_days = float(settings['STALE_UPDATE_DAYS'])
+    if last_success and time.time() - last_success > stale_days * 86400:
+        if updates.get('deferred_since'):
+            warnings.append(f"Updates deferred since {when(updates['deferred_since'])} because GPU jobs are "
+                            'running; stop them to let the next update run.')
+        else:
+            warnings.append(f"No successful automatic update in the last {settings['STALE_UPDATE_DAYS']} days.")
+    if Path('/var/run/reboot-required').exists():
+        warnings.append('A reboot is required to finish installed updates.')
+    if not warnings_only:
+        if health:
+            print(f"Disk checks: {when(health['checked_at'])}")
+        for disk in health.get('disks', []):
+            temperature = disk.get('temperature_c')
+            print(f"  {disk['device']}: {disk['model']}; {temperature if temperature is not None else '?'} C; "
+                  + ('WARNING' if disk['warnings'] else 'OK'))
+        for filesystem in health.get('storage', []):
+            print(f"  {filesystem['path']}: {filesystem['free_gib']} GiB free ({filesystem['free_percent']}%)")
+        print('Automatic updates:', updates.get('status', 'not checked'))
+        if last_success:
+            print('Last successful update:', when(last_success))
+        print('Logs:', LOGS)
+    for warning in warnings:
+        print('WARNING:', warning)
+    if not warnings and not warnings_only:
+        print('No health or update warnings.')
+    return 0
+
+
+def main():
+    args = sys.argv[1:]
+    if '-h' in args or '--help' in args:
+        print(__doc__.strip())
+        return 0
+    if '--version' in args:
+        print('gpu-upkeep', VERSION)
+        return 0
+    command = args[0] if args and not args[0].startswith('-') else 'status'
+    settings = load_settings()
+    if command == 'status':
+        return status(settings, '--warnings' in args)
+    if command in ('check', 'update'):
+        if os.geteuid() != 0:
+            raise SystemExit(f'gpu-upkeep {command} needs root; the systemd timers run it.')
+        return check(settings) if command == 'check' else update(settings)
+    raise SystemExit('Usage: gpu-upkeep [status [--warnings] | check | update]')
+
+
+if __name__ == '__main__':
+    sys.exit(main())
